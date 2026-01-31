@@ -78,13 +78,21 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
       vscode.commands.registerCommand('6502-tools.installTasks', async () => {
-        await InstallOrUpdateTasksPreservingComments();
+        await InstallOrUpdateTasksPreservingComments(context);
       }));
 }
 
 export function deactivate() {}
 
-function DesiredTasks(): any[] {
+function DesiredTasks(ChipType: string, UseUnprotectFlag: boolean): any[] {
+  const FlashArgs = ['-p', ChipType];
+
+  if (UseUnprotectFlag) {
+    FlashArgs.push('-uP');
+  }
+
+  FlashArgs.push('-w', './rom.bin');
+
   return [
     {
       label: 'Build (CMake)',
@@ -99,7 +107,7 @@ function DesiredTasks(): any[] {
       type: 'shell',
       options: {cwd: '${workspaceFolder}/build'},
       command: 'minipro',
-      args: ['-p', 'AT28C256', '-uP', '-w', './rom.bin'],
+      args: FlashArgs,
       problemMatcher: []
     },
     {
@@ -152,8 +160,8 @@ function ApplyJsoncEdits(text: string, edits: jsonc.Edit[]): string {
   return jsonc.applyEdits(text, edits);
 }
 
-async function PatchTasksJsonPreserveComments(tasksUri: vscode.Uri):
-    Promise<void> {
+async function PatchTasksJsonPreserveComments(
+    tasksUri: vscode.Uri, desired: any[]): Promise<void> {
   let text = await ReadTextOrEmpty(tasksUri);
 
   // If file doesn't exist, create a minimal JSONC skeleton.
@@ -168,9 +176,7 @@ async function PatchTasksJsonPreserveComments(tasksUri: vscode.Uri):
         tasksUri, new TextEncoder().encode(text));
   }
 
-  // Parse (to inspect existing tasks array and find labels)
   const root = ParseJsoncOrThrow(text);
-  const existingTasks: any[] = Array.isArray(root.tasks) ? root.tasks : [];
 
   // We'll build a list of JSONC edits and then apply them.
   const edits: jsonc.Edit[] = [];
@@ -195,8 +201,6 @@ async function PatchTasksJsonPreserveComments(tasksUri: vscode.Uri):
   const root2 = ParseJsoncOrThrow(text);
   const tasks2: any[] = Array.isArray(root2.tasks) ? root2.tasks : [];
 
-  const desired = DesiredTasks();
-
   // Upsert tasks by label
   for (const t of desired) {
     const idx = tasks2.findIndex(x => x?.label === t.label);
@@ -219,27 +223,31 @@ async function PatchTasksJsonPreserveComments(tasksUri: vscode.Uri):
   }
 
   // Write back only if changed
+  // Write back only if changed
   const original = await ReadTextOrEmpty(tasksUri);
   if (text !== original) {
-    // Use WorkspaceEdit so it behaves like an editor change (undo-friendly if
-    // file is open).
-    const we = new vscode.WorkspaceEdit();
-    // Replace full document text, but we preserved comments/formatting as much
-    // as possible by editing JSONC. VS Code doesn't support partial-file FS
-    // patch, so we set the whole file contents.
-    we.replace(
-        tasksUri,
-        new vscode.Range(
-            new vscode.Position(0, 0),
-            new vscode.Position(Number.MAX_SAFE_INTEGER, 0)),
-        text);
-    await vscode.workspace.applyEdit(we);
+    // If the file is open, use a WorkspaceEdit so it's undo-friendly.
+    const openDoc = vscode.workspace.textDocuments.find(
+        d => d.uri.toString() === tasksUri.toString());
+
+    if (openDoc) {
+      const lastLine = openDoc.lineAt(openDoc.lineCount - 1);
+      const fullRange =
+          new vscode.Range(new vscode.Position(0, 0), lastLine.range.end);
+
+      const we = new vscode.WorkspaceEdit();
+      we.replace(tasksUri, fullRange, text);
+      await vscode.workspace.applyEdit(we);
+    }
+
+    // Always write to disk so it updates even if not open
     await vscode.workspace.fs.writeFile(
         tasksUri, new TextEncoder().encode(text));
   }
 }
 
-async function InstallOrUpdateTasksPreservingComments(): Promise<void> {
+async function InstallOrUpdateTasksPreservingComments(
+    context: vscode.ExtensionContext): Promise<void> {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) {
     vscode.window.showErrorMessage(
@@ -247,13 +255,33 @@ async function InstallOrUpdateTasksPreservingComments(): Promise<void> {
     return;
   }
 
+  // 1) Chip type prompt
+  let ChipType = await PromptChipTypeFromMinipro(context);
+  if (!ChipType) {
+    vscode.window.showInformationMessage('6502 Tools: Cancelled.');
+    return;
+  }
+
+  // Remember last chip
+  await context.workspaceState.update('6502-tools.lastChipType', ChipType);
+
+  // 2) -uP prompt
+  const UseUP = await PromptUseUnprotectFlag(context);
+  if (UseUP === undefined) {
+    vscode.window.showInformationMessage('6502 Tools: Cancelled.');
+    return;
+  }
+
   const vscodeDir = await EnsureVscodeDir(folder);
   const tasksUri = vscode.Uri.joinPath(vscodeDir, 'tasks.json');
 
   try {
-    await PatchTasksJsonPreserveComments(tasksUri);
+    const desired = DesiredTasks(ChipType, UseUP);
+    await PatchTasksJsonPreserveComments(tasksUri, desired);
+
     vscode.window.showInformationMessage(
-        '6502 Tools: tasks.json updated (comments preserved).');
+        `6502 Tools: tasks.json updated (chip ${ChipType}, -uP ${
+            UseUP ? 'on' : 'off'}).`);
   } catch (e: any) {
     vscode.window.showErrorMessage(
         `6502 Tools: Could not update tasks.json: ${e?.message ?? String(e)}`);
@@ -290,7 +318,7 @@ function ParseDeviceList(text: string): string[] {
 
 async function GetMiniproDeviceList(context: vscode.ExtensionContext):
     Promise<string[]> {
-  const CacheKey = 'tools6502.MiniproDeviceList';
+  const CacheKey = '6502-tools.miniproDeviceList';
   const Cached = context.workspaceState.get<string[]>(CacheKey);
   if (Cached && Cached.length) {
     return Cached;
@@ -347,4 +375,29 @@ async function PromptChipTypeFromMinipro(context: vscode.ExtensionContext):
   });
 
   return Pick?.label;
+}
+
+async function PromptUseUnprotectFlag(context: vscode.ExtensionContext):
+    Promise<boolean|undefined> {
+  const Key = '6502-tools.useUnprotectFlag';
+  const Last = context.workspaceState.get<boolean>(Key, true);
+
+  const pick = await vscode.window.showQuickPick(
+      [
+        {
+          label: 'Yes',
+          description: 'Include -uP (unprotect / disable write-protect)',
+          picked: Last === true
+        },
+        {label: 'No', description: 'Do not include -uP', picked: Last === false}
+      ],
+      {title: '6502 Tools: Use -uP?', ignoreFocusOut: true});
+
+  if (!pick) {
+    return undefined;
+  }
+
+  const UseUP = (pick.label === 'Yes');
+  await context.workspaceState.update(Key, UseUP);
+  return UseUP;
 }
